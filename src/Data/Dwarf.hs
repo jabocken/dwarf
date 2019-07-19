@@ -7,7 +7,7 @@ module Data.Dwarf
   ( Endianess(..), TargetSize(..)
   , Sections(..)
   , parseInfo
-  , DieID, dieID, DIE(..), (!?)
+  , DieID, dieID, DIE(..), (!?), LNE(..), LNEFile(..)
   , DIERefs(..), DIEMap
   , Reader(..)
   , parseAranges
@@ -36,7 +36,6 @@ module Data.Dwarf
   , DW_DSC(..), dw_dsc
   ) where
 
-import           Control.Applicative (Applicative(..), (<$>), (<$))
 import           Control.Arrow ((&&&), (***))
 import           Control.Monad ((<=<))
 import           Control.Monad.Trans.Class (lift)
@@ -61,18 +60,13 @@ import qualified Data.Map as M
 import           Data.Maybe (listToMaybe)
 import           Data.String (IsString(..))
 import           Data.Text (Text)
-import qualified Data.Text as Text
-import           Data.Traversable (traverse)
 import           Data.Word (Word64)
 import           GHC.Generics (Generic)
 import           Numeric (showHex)
-import           TextShow (TextShow(..))
-import           TextShow.Generic (genericShowbPrec)
 
 newtype CUOffset = CUOffset Word64
   deriving (Eq, Ord, Read, Show, Generic)
 
-instance TextShow CUOffset where showbPrec = genericShowbPrec
 
 -- Don't export a constructor, so users can only read DieID's, not
 -- create fake ones, which is slightly safer.
@@ -86,6 +80,7 @@ data Sections = Sections
   { dsInfoSection :: B.ByteString
   , dsAbbrevSection :: B.ByteString
   , dsStrSection :: B.ByteString
+  , dsLineSection :: B.ByteString
   }
 
 data CUContext = CUContext
@@ -101,7 +96,6 @@ data CUContext = CUContext
 newtype AbbrevId = AbbrevId Word64
   deriving (Eq, Ord, Read, Show, Generic)
 
-instance TextShow AbbrevId where showbPrec = genericShowbPrec
 
 data DW_ABBREV = DW_ABBREV
     { abbrevId        :: AbbrevId
@@ -194,7 +188,6 @@ data Range = Range
   , rangeEnd :: !Word64
   } deriving (Eq, Ord, Read, Show, Generic)
 
-instance TextShow Range where showbPrec = genericShowbPrec
 
 -- Section 7.20 - Address Range Table
 -- Returns the ranges that belong to a CU
@@ -232,7 +225,6 @@ data DW_MACINFO
     | DW_MACINFO_vendor_ext Word64 Text   -- ^ Implementation defined
     deriving (Eq, Ord, Read, Show, Generic)
 
-instance TextShow DW_MACINFO where showbPrec = genericShowbPrec
 
 -- | Retrieves the macro information for a compilation unit from a given substring of the .debug_macinfo section. The offset
 -- into the .debug_macinfo section is obtained from the DW_AT_macro_info attribute of a compilation unit DIE.
@@ -267,7 +259,6 @@ data DW_CIEFDE
         }
     deriving (Eq, Ord, Read, Show, Generic)
 
-instance TextShow DW_CIEFDE where showbPrec = genericShowbPrec
 
 getCIEFDE :: Endianess -> TargetSize -> Get DW_CIEFDE
 getCIEFDE endianess target64 = do
@@ -359,16 +350,16 @@ data DIE = DIE
     { dieId         :: DieID              -- ^ Unique identifier for this entry.
     , dieTag        :: DW_TAG              -- ^ Type tag.
     , dieAttributes :: [(DW_AT, DW_ATVAL)] -- ^ Attribute tag and value pairs.
+    , dieLineInfo   :: Maybe LNE
     , dieChildren   :: [DIE]
     , dieReader     :: Reader         -- ^ Decoder used to decode this entry. May be needed to further parse attribute values.
     }
-instance Show DIE where show = Text.unpack . showt
-instance TextShow DIE where
-    showb (DIE (DieID i) tag attrs children _) =
+instance Show DIE where
+    show (DIE (DieID i) tag attrs _ children _) =
         mconcat $ mconcat
-        [ [ "DIE@", fromString (showHex i ""), "{", showb tag, " (", showb (length children), " children)"]
+        [ [ "DIE@", fromString (showHex i ""), "{", show tag, " (", show (length children), " children)"]
         , mconcat
-          [ [" ", showb attr, "=(", showb val, ")"]
+          [ [" ", show attr, "=(", show val, ")"]
           | (attr, val) <- attrs
           ]
         , [ "}" ]
@@ -440,10 +431,23 @@ getDIEAndDescendants cuContext = do
         if abbrevChildren abbrev
         then getDieAndSiblings offset cuContext
         else pure []
-      pure $ DIE offset tag (zip attrs values) children dr
+      let stmt_list_offset =
+            case map snd $ filter ((== DW_AT_stmt_list) . fst) $ zip attrs values of
+              [DW_ATVAL_UINT line_offset] -> Just line_offset
+              _ -> Nothing
+      let line_info = getLineInfo cuContext stmt_list_offset
+      pure $ DIE offset tag (zip attrs values) line_info children dr
   traverse go =<< lift getMAbbrevId
   where
     dr = cuReader cuContext
+
+getLineInfo :: CUContext -> Maybe Word64 -> Maybe LNE
+getLineInfo _ Nothing = Nothing
+getLineInfo c (Just o) = do
+ let info_bs = dsLineSection (cuSections c)
+     target_size  = drTarget64 (cuReader c)
+     endian_reader = desrEndianReader (drDesr (cuReader c))
+ Just (getAt (getLNE target_size endian_reader) o info_bs)
 
 getCUHeader ::
   EndianReader -> Sections ->

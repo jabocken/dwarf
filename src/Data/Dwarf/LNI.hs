@@ -2,7 +2,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Data.Dwarf.LNI where
 
-import           Control.Applicative (Applicative(..), (<$>))
 import           Control.Monad (replicateM)
 import           Data.Binary (Binary(..), Get)
 import           Data.Binary.Get (getWord8)
@@ -12,11 +11,8 @@ import           Data.Dwarf.Reader
 import           Data.Dwarf.Utils
 import           Data.Int (Int8, Int64)
 import           Data.Text (Text)
-import           Data.Traversable (traverse)
 import           Data.Word (Word8, Word64)
 import           GHC.Generics (Generic)
-import           TextShow (TextShow(..))
-import           TextShow.Generic (genericShowbPrec)
 
 -- Section 7.21 - Line Number Information
 data DW_LNI
@@ -36,9 +32,9 @@ data DW_LNI
     | DW_LNE_end_sequence
     | DW_LNE_set_address Word64
     | DW_LNE_define_file Text Word64 Word64 Word64
+    | DW_LNE_set_discriminator Word64
     deriving (Eq, Ord, Read, Show, Generic)
 
-instance TextShow DW_LNI where showbPrec = genericShowbPrec
 
 getDW_LNI :: Reader -> Int64 -> Word8 -> Word8 -> Word64 -> Get DW_LNI
 getDW_LNI dr line_base line_range opcode_base minimum_instruction_length = getWord8 >>= getDW_LNI_
@@ -49,6 +45,7 @@ getDW_LNI dr line_base line_range opcode_base minimum_instruction_length = getWo
                       getDW_LNE_ 0x01 = pure DW_LNE_end_sequence
                       getDW_LNE_ 0x02 = pure DW_LNE_set_address <*> drGetTargetAddress dr
                       getDW_LNE_ 0x03 = pure DW_LNE_define_file <*> getUTF8Str0 <*> getULEB128 <*> getULEB128 <*> getULEB128
+                      getDW_LNE_ 0x04 = pure DW_LNE_set_discriminator <*> getULEB128
                       getDW_LNE_ n | 0x80 <= n && n <= 0xff = fail $ "User DW_LNE data requires extension of parser for code " ++ show n
                       getDW_LNE_ n = fail $ "Unexpected DW_LNE code " ++ show n
           getDW_LNI_ 0x01 = pure DW_LNS_copy
@@ -112,6 +109,9 @@ stepLineMachine is_stmt mil lnm (DW_LNS_set_epilogue_begin : xs) =
 stepLineMachine is_stmt mil lnm (DW_LNS_set_isa isa : xs) =
     let new = lnm { lnmISA = isa }
     in stepLineMachine is_stmt mil new xs
+stepLineMachine is_stmt mil lnm (DW_LNE_set_discriminator d : xs) =
+    let new = lnm { lnmDiscriminator = d }
+    in stepLineMachine is_stmt mil new xs
 stepLineMachine is_stmt mil lnm (DW_LNE_end_sequence : xs) =
     let row = lnm { lnmEndSequence = True }
         new = defaultLNE is_stmt (lnmFiles lnm)
@@ -120,7 +120,7 @@ stepLineMachine is_stmt mil lnm (DW_LNE_set_address address : xs) =
     let new = lnm { lnmAddress = address }
     in stepLineMachine is_stmt mil new xs
 stepLineMachine is_stmt mil lnm (DW_LNE_define_file name dir_index time len : xs) =
-    let new = lnm { lnmFiles = lnmFiles lnm ++ [(name, dir_index, time, len)] }
+    let new = lnm { lnmFiles = lnmFiles lnm ++ [LNEFile name (fromIntegral dir_index) time len] }
     in stepLineMachine is_stmt mil new xs
 
 data DW_LNE = DW_LNE
@@ -134,12 +134,12 @@ data DW_LNE = DW_LNE
     , lnmPrologueEnd   :: Bool
     , lnmEpilogueBegin :: Bool
     , lnmISA           :: Word64
-    , lnmFiles         :: [(Text, Word64, Word64, Word64)]
+    , lnmDiscriminator :: Word64
+    , lnmFiles         :: [LNEFile]
     } deriving (Eq, Ord, Read, Show, Generic)
 
-instance TextShow DW_LNE where showbPrec = genericShowbPrec
 
-defaultLNE :: Bool -> [(Text, Word64, Word64, Word64)] -> DW_LNE
+defaultLNE :: Bool -> [LNEFile] -> DW_LNE
 defaultLNE is_stmt files = DW_LNE
     { lnmAddress       = 0
     , lnmFile          = 1
@@ -151,26 +151,40 @@ defaultLNE is_stmt files = DW_LNE
     , lnmPrologueEnd   = False
     , lnmEpilogueBegin = False
     , lnmISA           = 0
+    , lnmDiscriminator = 0
     , lnmFiles         = files
     }
 
 -- | Retrieves the line information for a DIE from a given substring of the .debug_line section. The offset
 -- into the .debug_line section is obtained from the DW_AT_stmt_list attribute of a DIE.
-parseLNE :: Endianess -> TargetSize -> Word64 -> B.ByteString -> ([Text], [DW_LNE])
+parseLNE :: Endianess -> TargetSize -> Word64 -> B.ByteString -> LNE
 parseLNE endianess target64 offset bs =
     let dr = endianReader endianess
     in getAt (getLNE target64 dr) offset bs
 
-getDebugLineFileNames :: Get [(Text, Word64, Word64, Word64)]
+data LNEFile = LNEFile
+  { lneFileName :: Text
+  , lneDirIndex :: Int
+  , lneLastMod  :: Word64
+  , lneLength   :: Word64
+  } deriving (Eq, Ord, Read, Show, Generic)
+
+data LNE = LNE
+  { lneDirs :: [Text]
+  , lneFiles :: [LNEFile]
+  , lneLines :: [DW_LNE]
+  } deriving (Eq, Ord, Read, Show, Generic)
+
+getDebugLineFileNames :: Get [LNEFile]
 getDebugLineFileNames = whileJust $ traverse entry =<< getNonEmptyUTF8Str0
   where
     entry file_name = do
       dir_index   <- getULEB128
       last_mod    <- getULEB128
       file_length <- getULEB128
-      pure (file_name, dir_index, last_mod, file_length)
+      pure (LNEFile file_name (fromIntegral dir_index) last_mod file_length)
 
-getLNE :: TargetSize -> EndianReader -> Get ([Text], [DW_LNE])
+getLNE :: TargetSize -> EndianReader -> Get LNE
 getLNE target64 der = do
     (desr, endPos)             <- getUnitLength der
     let dr                      = reader target64 desr
@@ -182,12 +196,12 @@ getLNE target64 der = do
     line_range                 <- getWord8
     opcode_base                <- getWord8
     _standard_opcode_lengths   <- replicateM (fromIntegral opcode_base - 1) getWord8
-    _include_directories       <- whileM (/= "") getUTF8Str0
+    include_directories       <- whileM (/= "") getUTF8Str0
     file_names                 <- getDebugLineFileNames
     curPos <- fromIntegral <$> Get.bytesRead
     -- Check if we have reached the end of the section.
     if endPos <= curPos
-      then pure (map (\(name, _, _, _) -> name) file_names, [])
+      then pure (LNE include_directories file_names [])
       else do
         line_program <-
           fmap (++ [DW_LNE_end_sequence]) .
@@ -196,4 +210,4 @@ getLNE target64 der = do
             fromIntegral minimum_instruction_length
         let initial_state = defaultLNE default_is_stmt file_names
             line_matrix = stepLineMachine default_is_stmt minimum_instruction_length initial_state line_program
-         in pure (map (\(name, _, _, _) -> name) file_names, line_matrix)
+         in pure (LNE include_directories file_names line_matrix)
