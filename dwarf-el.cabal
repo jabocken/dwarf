@@ -1,5 +1,5 @@
 Name:          dwarf-el
-Version:       0.4
+Version:       0.4.1
 License:       BSD3
 License-file:  LICENSE
 Category:      Data
@@ -16,9 +16,9 @@ library
     build-depends:   base >= 2 && < 5, transformers >= 0.3,
                      bytestring, containers, binary, text
     hs-source-dirs:  src
-    exposed-modules: Data.Dwarf
+    exposed-modules: Data.Dwarf,
+                     Data.Dwarf.Utils
     other-modules:   Data.Dwarf.Types,
-                     Data.Dwarf.Utils,
                      Data.Dwarf.Reader,
                      Data.Dwarf.Form,
                      Data.Dwarf.LNI,
@@ -31,4 +31,4 @@ library
 
 source-repository head
   type: git
-  location: https://github.com/Peaker/dwarf.git
+  location: https://github.com/jabocken/dwarf.git
